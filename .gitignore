@@ -1,0 +1,33 @@
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock.bak
+*.pdb
+
+# Tauri
+src-tauri/target/
+src-tauri/gen/
+
+# Node
+node_modules/
+dist/
+.pnpm-store/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# 前端构建产物
+src-tauri/WixTools/
+
+# 用户/日志
+*.log
+logs/
+
+# 环境配置
+.env
+.env.local
