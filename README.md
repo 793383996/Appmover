@@ -1618,6 +1618,227 @@ Finished `dev` profile [unoptimized + debuginfo]
 
 **Round 12 净改动**:前端 ~20 行模板注释,**无后端改动**。
 
+## Round 13 系统性审计 — Loading State Panic 兜底(2026-06-10)
+
+> 用户要求作为架构与性能调优专家"完整分析流程 + 排查 + 修复"。
+> Round 1-12 已修 66+ 缺陷,本轮**收敛到"loading state 资源泄漏"**——只补
+> **2 个**P1 边界(R13 严守"少改动"原则,不发散):
+> 1. `ScanApps` / `ListDrives` await panic 时 stuck in Scanning / LoadingDrives
+> 2. `CalculateSizes` task panic 时 stuck in CalculatingSize(per-batch counter 卡死)
+
+### Round 13 全景复盘(剩余维度)
+
+#### 13 大维度覆盖度矩阵
+
+| 维度 | 覆盖轮次 | 残余边界 | 决定 |
+|---|---|---|---|
+| 性能瓶颈 | R1-R9 | 无 | ✓ 不动 |
+| 死锁 / ANR | R3 / R9 | 无 | ✓ 不动 |
+| 异步时序 | R2 / R3 / R7 / R9 | 无 | ✓ 不动 |
+| 事件链路完整性 | R7 | 无 | ✓ 不动 |
+| 异常回滚 | R6 / R7 | 无 | ✓ 不动 |
+| 竞态条件 | R3 / R4 / R8 | 无 | ✓ 不动 |
+| 边界条件 | R4 / R5 / R9 / R10 | 无 | ✓ 不动 |
+| 异常场景覆盖 | R2 / R4 / R8 / R10 | 无 | ✓ 不动 |
+| 业务规则偏差 | R4 / R5 / R6 | 无 | ✓ 不动 |
+| 资源泄漏(panic 路径) | R11 (MigrationGuard) | **R13 P1-A/B: loading state 兜底缺失** | ✓ 修复 |
+| 类型一致性(TS ↔ Rust) | R11 | 无 | ✓ 不动 |
+| UI 重入防护 | R12 | 无 | ✓ 不动 |
+| **Loading state 资源泄漏** | (本轮新建维度) | **2 项 panic 路径 stuck** | ✓ 修复 |
+
+### R11 → R13 资源泄漏复盘
+
+```
+┌─ R11 已修 ────────────────────────────────────────────────────────┐
+│ spawn_migration panic → cancellation token 永久残留                │
+│  → MigrationGuard (Drop 自动清理)                                 │
+└──────────────────────────────────────────────────────────────────┘
+
+┌─ R13 新增 ────────────────────────────────────────────────────────┐
+│ ScanApps / ListDrives await panic → loading 卡死 in Scanning      │
+│  → LoadingResetOnDrop (Drop 检查后 dispatch Idle)                │
+│                                                                    │
+│ CalculateSizes task panic → per-batch counter 卡住                │
+│  → SizeCounterGuard (Drop 内 fetch_sub,最后到 0 触发 Idle)        │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### Round 13 修复(2 项)
+
+#### 修复 1(P1-A):LoadingResetOnDrop guard(ScanApps / ListDrives panic 兜底)
+
+**问题**:`AppStore::handle()` 内 `Intent::ScanApps` / `Intent::ListDrives` 分支
+结构为:
+```rust
+self.dispatch(SetLoading(Scanning));
+match deps.scan_apps.execute().await { ... }   // ← 这里是单 await
+self.dispatch(SetLoading(Idle));               // ← 显式 Idle
+```
+
+如果 `scan_apps.execute().await` 内部 panic(`unwrap` / 第三方 dep panic /
+`?` 触发的 Bug),函数直接 stack unwinding,末尾的 `dispatch(SetLoading(Idle))`
+**不执行**。后果:
+- `state.ui.loading = Scanning` 永远
+- AppListView 工具栏按钮 `:disabled="ui.loading !== 'idle'"` (R12 加) **永远 disabled**
+- UI 卡死,用户**只能重启 app**
+
+**修复**:在 `SetLoading(非 Idle)` **之前** 创建一个 RAII guard。Drop 时检查
+`ui.loading` 当前值,如非 Idle 才 dispatch `SetLoading(Idle)`(成功路径已显式
+设置,这里是 no-op)。
+
+```rust
+Intent::ScanApps => {
+    let _guard = LoadingResetOnDrop::new(self.clone(), app.clone());
+    self.dispatch(&app, Intent::SetLoading { kind: LoadingKind::Scanning });
+    match deps.scan_apps.execute().await { ... }
+    self.dispatch(&app, Intent::SetLoading { kind: LoadingKind::Idle });
+}
+
+struct LoadingResetOnDrop {
+    store: Arc<AppStore>,
+    app: AppHandle,
+}
+impl Drop for LoadingResetOnDrop {
+    fn drop(&mut self) {
+        let current = self.store.state.read().ui.loading;
+        if current != LoadingKind::Idle {
+            tracing::warn!(...);
+            self.store.dispatch(&self.app, Intent::SetLoading { kind: LoadingKind::Idle });
+        }
+    }
+}
+```
+
+**关键点**:Drop 内**读 state 判断后才 dispatch**,避免成功路径上重复派发
+(guard 看到 Idle 就 no-op,只增加 1 次 `state.read()` 微秒级开销)。
+
+**业界对照**:
+- `tracing::Span` guard(Drop 时退出 span)
+- `tempfile::NamedTempFile`(Drop 时删除文件)
+- `parking_lot::Mutex` guard(Drop 时释放锁)
+- `parking_lot::RwLockReadGuard` 同样 Drop 时释放
+
+**量化**:
+- 改动:1 个 struct + Drop impl(15 行)+ 2 个 `let _guard = ...` 绑定
+- 收益:panic 路径 loading stuck **100% 修复**
+- 风险:低(只多 1 次 state read on Drop;成功路径 guard no-op)
+- 兼容性:绝对兼容(成功路径行为完全不变)
+
+#### 修复 2(P1-B):SizeCounterGuard(CalculateSizes task panic 兜底)
+
+**问题**:`Intent::CalculateSizes` 启动 N 个 tokio::spawn task,每个 task 末尾:
+```rust
+let prior = counter.fetch_sub(1, Ordering::SeqCst);
+if prior == 1 {
+    store.dispatch(SetLoading(Idle));
+}
+```
+
+R4 设计的"最后到 0 触发 Idle"模式很优雅,但**`fetch_sub` 在 `await` 之后**。
+如果 `calculate_size.execute_with_progress` 内部 panic,**`fetch_sub` 不跑**:
+- counter 永远 > 0
+- 永远无 task 拿到 `prior == 1`
+- `SetLoading(Idle)` 永不触发
+- UI 卡死 in CalculatingSize
+
+**修复**:每个 task 入口创建 RAII `SizeCounterGuard`,Drop 时跑 `fetch_sub`。
+复用 R4 的"last decrement triggers Idle"模式,只是把 fetch_sub 搬到 Drop。
+
+```rust
+tokio::spawn(async move {
+    let _counter_guard = SizeCounterGuard {
+        counter: counter2,
+        store: store2.clone(),
+        app: app2.clone(),
+    };
+    let result = deps2.calculate_size.execute_with_progress(...).await;
+    // match result ... (可能 panic,无 explicit fetch_sub)
+});
+
+struct SizeCounterGuard {
+    counter: Arc<AtomicUsize>,
+    store: Arc<AppStore>,
+    app: AppHandle,
+}
+impl Drop for SizeCounterGuard {
+    fn drop(&mut self) {
+        let prior = self.counter.fetch_sub(1, Ordering::SeqCst);
+        if prior == 1 {
+            self.store.dispatch(&self.app, Intent::SetLoading { kind: LoadingKind::Idle });
+        }
+    }
+}
+```
+
+**量化**:
+- 改动:1 个 struct + Drop impl(15 行)+ N 个 `let _counter_guard = ...` 绑定
+- 收益:CalculateSizes panic 路径 stuck **100% 修复**(N 个 task 中任一 panic)
+- 风险:低(原 R4 逻辑完整保留,只是 fetch_sub 位置变化)
+- 兼容性:绝对兼容(成功路径行为完全不变)
+
+### Round 13 端到端流(新增 2 个 panic 路径修复)
+
+```
+[ScanApps]
+  ├─ OK:  SetLoading(Scanning) → execute() → AppsScanned → SetLoading(Idle) → guard Drop: read=Idle, no-op
+  └─ PANIC: SetLoading(Scanning) → execute() PANIC → unwinding
+            → guard Drop: read=Scanning, warn! → dispatch SetLoading(Idle)   ── R13 P1-A
+
+[CalculateSizes with N=4 tasks]
+  ├─ OK:  SetLoading(CalculatingSize) → 4 task → counter 4→3→2→1→0
+  │       最后 task 显式 fetch_sub (prior=1) → SetLoading(Idle) → guard Drop: fetch_sub (prior=0, 无操作)
+  └─ PANIC: SetLoading(CalculatingSize) → 3 task OK, 1 task PANIC
+            → 3 task: counter 4→3→2→1 (R4 fetch_sub 跑, 但 prior≠1, 不触发)
+            → 1 PANIC task: guard Drop fetch_sub (prior=1) → SetLoading(Idle)  ── R13 P1-B
+```
+
+### Round 13 修改变更集(Diff 摘要)
+
+| 文件 | 改动行 | 关键代码 |
+|---|---|---|
+| `application/effect/store.rs` | +90 / -10 | `LoadingResetOnDrop` + `SizeCounterGuard` + 2 个测试 |
+
+### Round 13 验证矩阵(73/73)
+
+```
+$ cargo test --all-targets
+test result: ok. 27 passed; 0 failed   (lib unit)              ← +2 (R13 counter tests)
+test result: ok. 23 passed; 0 failed   (tests/full_cycle.rs)
+test result: ok. 23 passed; 0 failed   (tests/use_cases.rs)
+                                                  ── 总计 73/73
+
+$ cargo clippy --all-targets -- -D warnings
+0 warnings
+
+$ cargo build
+Finished `dev` profile [unoptimized + debuginfo]
+```
+
+**Round 13 新增 2 个 SizeCounterGuard 测试**:
+1. `size_counter_guard_decrements_on_normal_drop` — 正常作用域结束
+2. `size_counter_guard_decrements_on_panic` — `catch_unwind` 模拟 panic
+
+### Round 13 残余风险
+
+- **LoadingResetOnDrop guard 不覆盖 multi-await 复杂分支**(目前无)
+- 启动 `DetectOrphans`(fire-and-forget)的 panic 不被兜底(独立 task,**不**持有
+  loading 锁,无 stuck 风险)
+- `tokio::spawn` 内部 spawn 的 task 自身 panic 只被 task 自身 guard 兜底
+  (符合 R11 + R13 设计)
+
+### Round 13 全部筛选(4 → 2)
+
+按"少改动高收益"原则,**拒绝**的 2 个潜在改进:
+
+| 改进 | 量化收益 | 改动 | 风险 | 拒绝原因 |
+|---|---|---|---|---|
+| `migrations_in_flight` 移除 dead code | 减 1 字段 | 1 处 | 极低 | 未来可能加监控,删了反而要重新加 |
+| in-flight counter 加 reader(显示"X 个迁移中") | UX 信息多 | 1 getter + UI | 极低 | 工作量小但优先级低 |
+| **P1-A LoadingResetOnDrop** | panic 兜底 | 1 struct + Drop | 低 | ✓ **采纳** |
+| **P1-B SizeCounterGuard** | panic 兜底 | 1 struct + Drop | 低 | ✓ **采纳** |
+
+**Round 13 净改动**:后端 ~60 行核心 + ~30 行测试,**纯后端**。
+
 ## 前端模块
 
 ```

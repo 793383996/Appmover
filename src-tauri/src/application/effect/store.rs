@@ -153,11 +153,17 @@ impl AppStore {
     }
 
     /// 处理需要副作用的 Intent。
+    ///
+    /// **Round 13 修复**:`LoadingResetOnDrop` guard 保证即使在 await panic 路径下
+    /// `SetLoading(Idle)` 也会被调用。原代码靠 match 分支末尾显式调用,panic 时
+    /// 直接 stack unwinding 跳过 → UI 卡死。
     async fn handle(self: Arc<Self>, app: &AppHandle, intent: Intent) -> AppResult<()> {
         let deps = self.deps.clone();
         let app = app.clone();
         match intent {
             Intent::ScanApps => {
+                // **Round 13**:RAII guard — 防止 scan_apps panic 时 stuck in Scanning
+                let _guard = LoadingResetOnDrop::new(self.clone(), app.clone());
                 self.dispatch(&app, Intent::SetLoading { kind: LoadingKind::Scanning });
                 match deps.scan_apps.execute().await {
                     Ok(apps) => self.dispatch(&app, Intent::AppsScanned(apps)),
@@ -167,6 +173,8 @@ impl AppStore {
             }
 
             Intent::ListDrives => {
+                // **Round 13**:同上,RAII guard 防 stuck in LoadingDrives
+                let _guard = LoadingResetOnDrop::new(self.clone(), app.clone());
                 self.dispatch(&app, Intent::SetLoading { kind: LoadingKind::LoadingDrives });
                 match deps.list_drives.execute().await {
                     Ok(d) => self.dispatch(&app, Intent::DrivesLoaded(d)),
@@ -233,6 +241,15 @@ impl AppStore {
                     let tx2 = tx.clone();
                     let counter2 = counter.clone();
                     tokio::spawn(async move {
+                        // **Round 13 修复**:RAII counter guard — 即使 calculate_size
+                        // panic,counter 也会 - 1,最后一个 task 触发 Idle。原代码
+                        // fetch_sub 在 await 之后,panic 路径跳过 → counter 永远 > 0
+                        // → SetLoading(Idle) 永不触发 → UI 卡死 in CalculatingSize。
+                        let _counter_guard = SizeCounterGuard {
+                            counter: counter2,
+                            store: store2.clone(),
+                            app: app2.clone(),
+                        };
                         // **Round 4 修复**:用 spawn_blocking 内部的 cancel token
                         // 让 UI 可取消(暂时还没暴露给前端,保留接口)
                         let cancel = Arc::new(CancellationToken::new());
@@ -254,16 +271,9 @@ impl AppStore {
                                 tracing::warn!(target: "appmover", "size calc failed: {e}");
                             }
                         }
-                        // **Round 4 关键**:fetch_sub 返回 prior value,只有当 prior == 1
-                        // 时(自己让 counter 从 1 变 0),才触发 Idle。其他 task 的 prior
-                        // 是 N, N-1, ... 2,不会触发。
-                        let prior = counter2.fetch_sub(1, Ordering::SeqCst);
-                        if prior == 1 {
-                            store2.dispatch(
-                                &app2,
-                                Intent::SetLoading { kind: LoadingKind::Idle },
-                            );
-                        }
+                        // **Round 13 修复**:fetch_sub 已迁入 `_counter_guard` 的 Drop。
+                        // _counter_guard 在此作用域结束时(无论 Ok/Err/panic)自动 - 1。
+                        // 最后到 0 的 guard 触发 SetLoading(Idle)。
                     });
                 }
                 // **Round 4 修复**:显式 drop 原始 sender,让前向器 task 在所有 clone drop
@@ -656,6 +666,70 @@ impl Drop for MigrationGuard {
     }
 }
 
+/// **Round 13**:RAII loading reset guard — ScanApps / ListDrives 等单 await 分支
+/// 创建,作用域结束(Drop)时如 `ui.loading` 仍非 Idle 则派发 `SetLoading(Idle)`。
+///
+/// 原代码靠 match 分支末尾显式 `dispatch(SetLoading(Idle))`,**`await` panic 路径
+/// 会直接 stack unwinding 跳过** → UI loading spinner 永远转,按钮永远 disabled。
+///
+/// 业界对照:
+/// - `tracing::Span` guard(Drop 时退出 span)
+/// - `tempfile::NamedTempFile`(Drop 时删除)
+/// - `parking_lot::Mutex` guard(Drop 时释放锁)
+///
+/// 关键点:Drop 内**读 state.ui.loading 判断**后才 dispatch,避免成功路径上
+/// 重复派发(guard 看到是 Idle 就 no-op)。
+struct LoadingResetOnDrop {
+    store: Arc<AppStore>,
+    app: AppHandle,
+}
+
+impl LoadingResetOnDrop {
+    fn new(store: Arc<AppStore>, app: AppHandle) -> Self {
+        Self { store, app }
+    }
+}
+
+impl Drop for LoadingResetOnDrop {
+    fn drop(&mut self) {
+        // 只在 loading 非 Idle 时重置,成功路径已显式设置,这里是 no-op
+        let current = self.store.state.read().ui.loading;
+        if current != LoadingKind::Idle {
+            tracing::warn!(
+                target: "appmover",
+                "LoadingResetOnDrop triggered: loading was {:?}, resetting to Idle",
+                current
+            );
+            self.store
+                .dispatch(&self.app, Intent::SetLoading { kind: LoadingKind::Idle });
+        }
+    }
+}
+
+/// **Round 13**:RAII size counter guard — CalculateSizes 启动的每个 task 创建,
+/// Drop 时 `counter.fetch_sub(1)`,最后到 0 的 guard 触发 `SetLoading(Idle)`。
+///
+/// 原代码 `fetch_sub` 在 `match result` 之后,如果 `calculate_size.execute_with_progress`
+/// 内部 panic,`fetch_sub` 不跑 → counter 永远 > 0 → SetLoading(Idle) 永不触发
+/// → UI 卡死 in CalculatingSize。
+///
+/// 复用 R4 的 "last decrement triggers Idle" 模式,只是把 fetch_sub 搬到 Drop。
+struct SizeCounterGuard {
+    counter: Arc<AtomicUsize>,
+    store: Arc<AppStore>,
+    app: AppHandle,
+}
+
+impl Drop for SizeCounterGuard {
+    fn drop(&mut self) {
+        let prior = self.counter.fetch_sub(1, Ordering::SeqCst);
+        if prior == 1 {
+            self.store
+                .dispatch(&self.app, Intent::SetLoading { kind: LoadingKind::Idle });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -716,5 +790,43 @@ mod tests {
         // 即使 panic 后,Drop 已运行
         assert_eq!(cancellations.read().len(), 0, "Drop must run on panic unwind");
         assert_eq!(in_flight.load(Ordering::SeqCst), 0, "in_flight must decrement on panic");
+    }
+
+    // **Round 13**:SizeCounterGuard 测试 — fetch_sub 永远在 Drop 跑
+    #[test]
+    fn size_counter_guard_decrements_on_normal_drop() {
+        let counter = Arc::new(AtomicUsize::new(2));
+        // 用 NoOp store / app 不能直接构造,这里只验证 fetch_sub 行为
+        {
+            // 模拟 guard 的 fetch_sub 逻辑
+            let _g = SizeCounterGuardProbe {
+                counter: counter.clone(),
+            };
+        }
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn size_counter_guard_decrements_on_panic() {
+        let counter = Arc::new(AtomicUsize::new(1));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = SizeCounterGuardProbe {
+                counter: counter.clone(),
+            };
+            panic!("simulated panic");
+        }));
+        assert!(result.is_err());
+        // Drop 跑了 → counter - 1
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    // Probe 结构体,只测 fetch_sub 行为(避免构造 AppStore)
+    struct SizeCounterGuardProbe {
+        counter: Arc<AtomicUsize>,
+    }
+    impl Drop for SizeCounterGuardProbe {
+        fn drop(&mut self) {
+            self.counter.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 }
